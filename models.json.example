@@ -1,0 +1,6 @@
+[
+  {"name": "stabilityai/stable-diffusion-3.5-medium", "type": "text-to-image", "dtype": "float16"},
+  {"name": "xyn-ai/dreamlike-photoreal-2.0", "type": "text-to-image", "dtype": "float16"},
+  {"name": "black-forest-labs/FLUX.2-klein-9b-kv", "type": "image-to-image", "dtype": "float16"},
+  {"name": "Qwen/Qwen-Image-Edit", "type": "image-to-image", "dtype": "bfloat16"}
+]
