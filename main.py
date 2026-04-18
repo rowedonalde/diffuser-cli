@@ -145,17 +145,39 @@ def run_interactive():
     pipe = DiffusionPipeline.from_pretrained(selected_model["name"], torch_dtype=selected_model["dtype"])
     pipe = pipe.to(device)
 
+    ip_adapter_config = selected_model.get("ip_adapter")
+    if ip_adapter_config:
+        print("Loading IP-Adapter...")
+        pipe.load_ip_adapter(
+            ip_adapter_config["repo"],
+            subfolder=ip_adapter_config.get("subfolder"),
+            weight_name=ip_adapter_config["weight_name"],
+        )
+        pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 0.5))
+
     while True:
         try:
+            input_image = None
             if selected_model["type"] == ModelType.IMAGE_TO_IMAGE:
                 image_source = input("Input image (file path or URL): ").strip()
                 input_image = load_image(image_source)
+            elif ip_adapter_config:
+                image_source = input("Reference image for IP-Adapter (file path/URL, or Enter to skip): ").strip()
+                if image_source:
+                    input_image = load_image(image_source)
             prompt = input("Image description: ").strip()
         except KeyboardInterrupt:
             return
 
         if selected_model["type"] == ModelType.IMAGE_TO_IMAGE:
             image = pipe(prompt=prompt, image=input_image).images[0]
+        elif input_image is not None:
+            pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 0.5))
+            image = pipe(prompt=prompt, ip_adapter_image=input_image).images[0]
+        elif ip_adapter_config:
+            pipe.set_ip_adapter_scale(0.0)
+            blank = Image.new("RGB", (224, 224), (0, 0, 0))
+            image = pipe(prompt=prompt, ip_adapter_image=blank).images[0]
         else:
             image = pipe(prompt).images[0]
 
