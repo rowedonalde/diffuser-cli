@@ -6,10 +6,14 @@ import sys
 import urllib.request
 from io import BytesIO
 
+import cv2
+import numpy as np
 import torch
 from diffusers import DiffusionPipeline
 from enum import Enum
 from PIL import Image
+
+FACEID_EMBED_DIM = 512
 
 
 class ModelType(Enum):
@@ -50,6 +54,47 @@ def get_device():
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def make_face_app(device: str):
+    from insightface.app import FaceAnalysis
+
+    if device == "cuda":
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        ctx_id = 0
+    else:
+        providers = ["CPUExecutionProvider"]
+        ctx_id = -1
+    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+    return app
+
+
+def faceid_embeds_from_image(image: Image.Image, app, dtype, device):
+    # InsightFace expects BGR; PIL gives RGB, so swap channels.
+    arr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+    faces = app.get(arr)
+    if not faces:
+        raise ValueError("No face detected in IP-Adapter reference image")
+    embed = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0)
+    ref = torch.stack([embed], dim=0).unsqueeze(0)
+    neg = torch.zeros_like(ref)
+    return torch.cat([neg, ref]).to(dtype=dtype, device=device)
+
+
+def blank_faceid_embeds(dtype, device):
+    return torch.zeros((2, 1, 1, FACEID_EMBED_DIM), dtype=dtype, device=device)
+
+
+def load_ip_adapter_into(pipe, ip_adapter_config: dict):
+    print("Loading IP-Adapter...")
+    load_kwargs = {
+        "subfolder": ip_adapter_config.get("subfolder"),
+        "weight_name": ip_adapter_config["weight_name"],
+    }
+    if ip_adapter_config.get("variant") == "faceid":
+        load_kwargs["image_encoder_folder"] = None
+    pipe.load_ip_adapter(ip_adapter_config["repo"], **load_kwargs)
 
 
 def load_pipeline(model_name: str, models: list) -> tuple:
@@ -123,13 +168,12 @@ def run_batch(batch_file: str):
     device = get_device()
 
     ip_adapter_config = selected_model.get("ip_adapter")
+    is_faceid = bool(ip_adapter_config and ip_adapter_config.get("variant") == "faceid")
+    face_app = None
     if ip_adapter_config:
-        print("Loading IP-Adapter...")
-        pipe.load_ip_adapter(
-            ip_adapter_config["repo"],
-            subfolder=ip_adapter_config.get("subfolder"),
-            weight_name=ip_adapter_config["weight_name"],
-        )
+        load_ip_adapter_into(pipe, ip_adapter_config)
+        if is_faceid:
+            face_app = make_face_app(device)
 
     total = len(images)
     print(f"\nBatch mode: generating {total} images\n")
@@ -175,10 +219,21 @@ def run_batch(batch_file: str):
                 if "ip_adapter_image" in item:
                     scale = item.get("ip_adapter_scale", ip_adapter_config.get("scale", 0.5))
                     pipe.set_ip_adapter_scale(scale)
-                    pipe_kwargs["ip_adapter_image"] = load_image(item["ip_adapter_image"])
+                    ref = load_image(item["ip_adapter_image"])
+                    if is_faceid:
+                        pipe_kwargs["ip_adapter_image_embeds"] = [
+                            faceid_embeds_from_image(ref, face_app, selected_model["dtype"], device)
+                        ]
+                    else:
+                        pipe_kwargs["ip_adapter_image"] = ref
                 else:
                     pipe.set_ip_adapter_scale(0.0)
-                    pipe_kwargs["ip_adapter_image"] = Image.new("RGB", (224, 224), (0, 0, 0))
+                    if is_faceid:
+                        pipe_kwargs["ip_adapter_image_embeds"] = [
+                            blank_faceid_embeds(selected_model["dtype"], device)
+                        ]
+                    else:
+                        pipe_kwargs["ip_adapter_image"] = Image.new("RGB", (224, 224), (0, 0, 0))
                 image = pipe(**pipe_kwargs).images[0]
             else:
                 image = pipe(**pipe_kwargs).images[0]
@@ -206,14 +261,13 @@ def run_interactive():
     pipe = pipe.to(device)
 
     ip_adapter_config = selected_model.get("ip_adapter")
+    is_faceid = bool(ip_adapter_config and ip_adapter_config.get("variant") == "faceid")
+    face_app = None
     if ip_adapter_config:
-        print("Loading IP-Adapter...")
-        pipe.load_ip_adapter(
-            ip_adapter_config["repo"],
-            subfolder=ip_adapter_config.get("subfolder"),
-            weight_name=ip_adapter_config["weight_name"],
-        )
+        load_ip_adapter_into(pipe, ip_adapter_config)
         pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 0.5))
+        if is_faceid:
+            face_app = make_face_app(device)
 
     while True:
         try:
@@ -233,11 +287,19 @@ def run_interactive():
             image = pipe(prompt=prompt, image=input_image).images[0]
         elif input_image is not None:
             pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 0.5))
-            image = pipe(prompt=prompt, ip_adapter_image=input_image).images[0]
+            if is_faceid:
+                embeds = faceid_embeds_from_image(input_image, face_app, selected_model["dtype"], device)
+                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds]).images[0]
+            else:
+                image = pipe(prompt=prompt, ip_adapter_image=input_image).images[0]
         elif ip_adapter_config:
             pipe.set_ip_adapter_scale(0.0)
-            blank = Image.new("RGB", (224, 224), (0, 0, 0))
-            image = pipe(prompt=prompt, ip_adapter_image=blank).images[0]
+            if is_faceid:
+                embeds = blank_faceid_embeds(selected_model["dtype"], device)
+                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds]).images[0]
+            else:
+                blank = Image.new("RGB", (224, 224), (0, 0, 0))
+                image = pipe(prompt=prompt, ip_adapter_image=blank).images[0]
         else:
             image = pipe(prompt).images[0]
 
