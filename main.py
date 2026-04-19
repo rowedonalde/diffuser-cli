@@ -72,16 +72,37 @@ def run_batch(batch_file: str):
     Expected batch JSON format:
     {
         "model_name": "xyn-ai/dreamlike-photoreal-2.0",
-        "output_dir": "~/Pictures/dating-app-personas",
+        "negative_prompt": "lowres, bad anatomy, ...",
+        "steps": 28,
+        "guidance": 7.0,
+        "width": 640,
+        "height": 896,
         "images": [
             {
-                "persona": "alex_chen",
-                "filename": "alex_chen_01.png",
-                "prompt": "photo of a 28-year-old man on a mountain summit..."
+                "persona": "akemi",
+                "output": "/abs/path/to/akemi_base.png",
+                "prompt": "anime-style waist-up portrait ...",
+                "seed": 42
             },
-            ...
+            {
+                "persona": "akemi",
+                "output": "/abs/path/to/s01_c1.png",
+                "prompt": "akemi smiling under cherry trees ...",
+                "seed": 1043,
+                "ip_adapter_image": "/abs/path/to/akemi_base.png",
+                "ip_adapter_scale": 0.75
+            }
         ]
     }
+
+    Top-level negative_prompt/steps/guidance/seed/width/height act as
+    defaults; any image may override them. Each image requires an `output`
+    path (absolute or ~-expandable); existing non-empty files are skipped.
+    Image-to-image models still read `input_image`. If the selected model
+    has an ip_adapter config in models.json, IP-Adapter is loaded once;
+    per-image `ip_adapter_image` and `ip_adapter_scale` are honored, and
+    images that omit them fall back to a 224x224 black reference at
+    scale 0.0 so the pipeline signature stays consistent.
     """
     batch_path = os.path.expanduser(batch_file)
     if not os.path.exists(batch_path):
@@ -92,25 +113,55 @@ def run_batch(batch_file: str):
         batch = json.load(f)
 
     model_name = batch["model_name"]
-    output_dir = os.path.expanduser(batch["output_dir"])
     images = batch["images"]
 
-    os.makedirs(output_dir, exist_ok=True)
+    default_keys = ("negative_prompt", "steps", "guidance", "seed", "width", "height")
+    defaults = {k: batch[k] for k in default_keys if k in batch}
 
     models = load_models()
     pipe, selected_model = load_pipeline(model_name, models)
+    device = get_device()
+
+    ip_adapter_config = selected_model.get("ip_adapter")
+    if ip_adapter_config:
+        print("Loading IP-Adapter...")
+        pipe.load_ip_adapter(
+            ip_adapter_config["repo"],
+            subfolder=ip_adapter_config.get("subfolder"),
+            weight_name=ip_adapter_config["weight_name"],
+        )
 
     total = len(images)
-    print(f"\nBatch mode: generating {total} images → {output_dir}\n")
+    print(f"\nBatch mode: generating {total} images\n")
 
     for i, item in enumerate(images, 1):
-        filename = os.path.join(output_dir, item["filename"])
+        output_path = os.path.expanduser(item["output"])
         persona = item.get("persona", "unknown")
         prompt = item["prompt"]
 
-        if os.path.exists(filename):
-            print(f"[{i}/{total}] Skipping {item['filename']} (already exists)")
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[{i}/{total}] Skipping {output_path} (already exists)")
             continue
+
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        params = {**defaults, **{k: item[k] for k in default_keys if k in item}}
+
+        pipe_kwargs = {"prompt": prompt}
+        if "negative_prompt" in params:
+            pipe_kwargs["negative_prompt"] = params["negative_prompt"]
+        if "steps" in params:
+            pipe_kwargs["num_inference_steps"] = params["steps"]
+        if "guidance" in params:
+            pipe_kwargs["guidance_scale"] = params["guidance"]
+        if "width" in params:
+            pipe_kwargs["width"] = params["width"]
+        if "height" in params:
+            pipe_kwargs["height"] = params["height"]
+        if "seed" in params:
+            pipe_kwargs["generator"] = torch.Generator(device).manual_seed(params["seed"])
 
         print(f"[{i}/{total}] {persona}: {prompt[:80]}...")
         try:
@@ -118,13 +169,22 @@ def run_batch(batch_file: str):
                 if "input_image" not in item:
                     print(f"  Warning: image-to-image model requires 'input_image' field, skipping.")
                     continue
-                input_image = load_image(item["input_image"])
-                image = pipe(prompt=prompt, image=input_image).images[0]
+                pipe_kwargs["image"] = load_image(item["input_image"])
+                image = pipe(**pipe_kwargs).images[0]
+            elif ip_adapter_config:
+                if "ip_adapter_image" in item:
+                    scale = item.get("ip_adapter_scale", ip_adapter_config.get("scale", 0.5))
+                    pipe.set_ip_adapter_scale(scale)
+                    pipe_kwargs["ip_adapter_image"] = load_image(item["ip_adapter_image"])
+                else:
+                    pipe.set_ip_adapter_scale(0.0)
+                    pipe_kwargs["ip_adapter_image"] = Image.new("RGB", (224, 224), (0, 0, 0))
+                image = pipe(**pipe_kwargs).images[0]
             else:
-                image = pipe(prompt).images[0]
+                image = pipe(**pipe_kwargs).images[0]
 
-            image.save(filename)
-            print(f"  ✓ Saved to {filename}")
+            image.save(output_path)
+            print(f"  ✓ Saved to {output_path}")
         except Exception as e:
             print(f"  ✗ Error generating image: {e}", file=sys.stderr)
 
