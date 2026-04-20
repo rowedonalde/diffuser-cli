@@ -1,0 +1,24 @@
+{
+  "model_name": "xyn-ai/dreamlike-photoreal-2.0",
+  "negative_prompt": "lowres, bad anatomy, bad hands, extra fingers, watermark, blurry, deformed",
+  "steps": 20,
+  "guidance": 7.0,
+  "width": 512,
+  "height": 512,
+  "images": [
+    {
+      "persona": "smoke_test",
+      "output": "~/Pictures/diffusion-renders/smoke/base.png",
+      "prompt": "studio portrait of a young woman with short dark hair, neutral expression, plain gray backdrop, soft front lighting, photorealistic, 8k uhd, sharp focus, Fujifilm XT3",
+      "seed": 42
+    },
+    {
+      "persona": "smoke_test",
+      "output": "~/Pictures/diffusion-renders/smoke/scene.png",
+      "prompt": "same woman walking through a sunlit city park in autumn, wearing a wool coat, golden hour, candid photography, photorealistic, 8k, sharp focus",
+      "seed": 1337,
+      "ip_adapter_image": "~/Pictures/diffusion-renders/smoke/base.png",
+      "ip_adapter_scale": 0.7
+    }
+  ]
+}
