@@ -9,11 +9,17 @@ from io import BytesIO
 import cv2
 import numpy as np
 import torch
-from diffusers import DiffusionPipeline
+from diffusers import DDIMScheduler, DiffusionPipeline, EulerDiscreteScheduler
 from enum import Enum
 from PIL import Image
 
 FACEID_EMBED_DIM = 512
+FACEID_MAX_SIDE = 512  # SD1.5 FaceID LoRA was trained at 512; higher res corrupts output.
+
+SCHEDULER_MAP = {
+    "ddim": DDIMScheduler,
+    "euler": EulerDiscreteScheduler,
+}
 
 
 class ModelType(Enum):
@@ -86,6 +92,16 @@ def blank_faceid_embeds(dtype, device):
     return torch.zeros((2, 1, 1, FACEID_EMBED_DIM), dtype=dtype, device=device)
 
 
+def downscale_for_faceid(width: int, height: int) -> tuple[int, int]:
+    max_side = max(width, height)
+    if max_side <= FACEID_MAX_SIDE:
+        return width, height
+    scale = FACEID_MAX_SIDE / max_side
+    def round8(x: float) -> int:
+        return max(64, int(round(x * scale / 8)) * 8)
+    return round8(width), round8(height)
+
+
 def load_ip_adapter_into(pipe, ip_adapter_config: dict):
     print("Loading IP-Adapter...")
     load_kwargs = {
@@ -106,6 +122,10 @@ def load_pipeline(model_name: str, models: list) -> tuple:
     device = get_device()
     print(f"Loading model '{model_name}' on device '{device}'...")
     pipe = DiffusionPipeline.from_pretrained(selected_model["name"], torch_dtype=selected_model["dtype"])
+    scheduler_name = selected_model.get("scheduler")
+    if scheduler_name:
+        scheduler_cls = SCHEDULER_MAP[scheduler_name]
+        pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
     return pipe, selected_model
 
@@ -200,10 +220,21 @@ def run_batch(batch_file: str):
             pipe_kwargs["num_inference_steps"] = params["steps"]
         if "guidance" in params:
             pipe_kwargs["guidance_scale"] = params["guidance"]
-        if "width" in params:
-            pipe_kwargs["width"] = params["width"]
-        if "height" in params:
-            pipe_kwargs["height"] = params["height"]
+        target_w = params.get("width")
+        target_h = params.get("height")
+        if is_faceid:
+            if target_w is None or target_h is None:
+                pipe_kwargs["width"] = FACEID_MAX_SIDE
+                pipe_kwargs["height"] = FACEID_MAX_SIDE
+            else:
+                gen_w, gen_h = downscale_for_faceid(target_w, target_h)
+                pipe_kwargs["width"] = gen_w
+                pipe_kwargs["height"] = gen_h
+        else:
+            if target_w is not None:
+                pipe_kwargs["width"] = target_w
+            if target_h is not None:
+                pipe_kwargs["height"] = target_h
         if "seed" in params:
             pipe_kwargs["generator"] = torch.Generator(device).manual_seed(params["seed"])
 
@@ -238,6 +269,8 @@ def run_batch(batch_file: str):
             else:
                 image = pipe(**pipe_kwargs).images[0]
 
+            if is_faceid and target_w and target_h and image.size != (target_w, target_h):
+                image = image.resize((target_w, target_h), Image.LANCZOS)
             image.save(output_path)
             print(f"  ✓ Saved to {output_path}")
         except Exception as e:
@@ -255,10 +288,8 @@ def run_interactive():
         print(f"{i}: {model['name']} ({model['type'].value})")
 
     selected_model = models[int(input())]
-
+    pipe, selected_model = load_pipeline(selected_model["name"], models)
     device = get_device()
-    pipe = DiffusionPipeline.from_pretrained(selected_model["name"], torch_dtype=selected_model["dtype"])
-    pipe = pipe.to(device)
 
     ip_adapter_config = selected_model.get("ip_adapter")
     is_faceid = bool(ip_adapter_config and ip_adapter_config.get("variant") == "faceid")
@@ -283,20 +314,21 @@ def run_interactive():
         except KeyboardInterrupt:
             return
 
+        faceid_size_kwargs = {"width": FACEID_MAX_SIDE, "height": FACEID_MAX_SIDE} if is_faceid else {}
         if selected_model["type"] == ModelType.IMAGE_TO_IMAGE:
             image = pipe(prompt=prompt, image=input_image).images[0]
         elif input_image is not None:
             pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 0.5))
             if is_faceid:
                 embeds = faceid_embeds_from_image(input_image, face_app, selected_model["dtype"], device)
-                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds]).images[0]
+                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds], **faceid_size_kwargs).images[0]
             else:
                 image = pipe(prompt=prompt, ip_adapter_image=input_image).images[0]
         elif ip_adapter_config:
             pipe.set_ip_adapter_scale(0.0)
             if is_faceid:
                 embeds = blank_faceid_embeds(selected_model["dtype"], device)
-                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds]).images[0]
+                image = pipe(prompt=prompt, ip_adapter_image_embeds=[embeds], **faceid_size_kwargs).images[0]
             else:
                 blank = Image.new("RGB", (224, 224), (0, 0, 0))
                 image = pipe(prompt=prompt, ip_adapter_image=blank).images[0]
